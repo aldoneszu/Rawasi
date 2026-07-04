@@ -451,7 +451,7 @@ function tplRegisterForm(){
     </div>
     <div class="field"><label>الاسم بالكامل</label><input id="regName" placeholder="اكتب اسمك"></div>
     <div class="field"><label>اسم المستخدم</label><input id="regUsername" placeholder="بالإنجليزية بدون مسافات" autocomplete="username"></div>
-    <div class="field"><label>كلمة المرور</label><input id="regPassword" type="password" placeholder="6 أحرف على الأقل" autocomplete="new-password"></div>
+    <div class="field"><label>كلمة المرور</label><input id="regPassword" type="password" placeholder="8 أحرف على الأقل" autocomplete="new-password"></div>
     <button class="btn" id="btnRegister">إنشاء الحساب</button>`;
 }
 function bindAuthEvents(){
@@ -482,13 +482,17 @@ async function doRegister(){
   const uname = $('#regUsername').value.trim();
   const pass = $('#regPassword').value;
   if(!regRole){ toast('اختر دورك أولاً'); return; }
-  if(!name || !uname || pass.length<6){ toast('أكمل البيانات (كلمة المرور 6 أحرف على الأقل)'); return; }
+  if(!name || !uname || pass.length<8){ toast('أكمل البيانات (كلمة المرور 8 أحرف على الأقل)'); return; }
   const cleanUname = uname.toLowerCase().replace(/[^a-z0-9_.]/g,'');
   if(cleanUname.length<3){ toast('اسم مستخدم غير صالح'); return; }
   const btn = $('#btnRegister'); btn.disabled=true; btn.textContent='جارِ الإنشاء...';
+  let reserved = false;
   try{
-    const snap = await db.ref('usernames/'+cleanUname).get();
-    if(snap.exists()){ toast('اسم المستخدم مستخدم بالفعل'); btn.disabled=false; btn.textContent='إنشاء الحساب'; return; }
+    // حجز اسم المستخدم بشكل ذرّي (transaction) بدل قراءة-ثم-كتابة، عشان نمنع
+    // احتمال (نادر لكن حقيقي) إن اتنين يسجلوا بنفس اليوزرنيم في نفس اللحظة بالظبط
+    const txResult = await db.ref('usernames/'+cleanUname).transaction(cur => cur===null ? 'RESERVED' : undefined);
+    if(!txResult.committed){ toast('اسم المستخدم مستخدم بالفعل'); return; }
+    reserved = true;
     const cred = await auth.createUserWithEmailAndPassword(usernameToEmail(cleanUname), pass);
     const newUid = cred.user.uid;
     await db.ref('users/'+newUid).set({
@@ -497,6 +501,7 @@ async function doRegister(){
     await db.ref('usernames/'+cleanUname).set(newUid);
     toast('تم إنشاء الحساب، بانتظار تفعيل الأدمن');
   }catch(e){
+    if(reserved){ try{ await db.ref('usernames/'+cleanUname).remove(); }catch(_){} }
     toast('حدث خطأ: ' + (e.message||'حاول مرة أخرى'));
   } finally { if(btn){btn.disabled=false; btn.textContent='إنشاء الحساب';} }
 }
@@ -565,7 +570,8 @@ auth.onAuthStateChanged(user=>{
     const p = snap.val();
     if(!p){ state.route='auth'; render(); return; }
     state.profile = p;
-    if(p.status==='banned'){ state.route='banned'; }
+    if(p.role==='admin'){ state.route='ready'; setupPresence(); }
+    else if(p.status==='banned'){ state.route='banned'; }
     else if(p.status!=='active'){ state.route='pending'; }
     else { state.route='ready'; setupPresence(); listenIncomingCalls(); }
     render();
@@ -765,8 +771,14 @@ async function loadAdminAssign(){
   }).join('') || '<div class="empty-state">لا توجد معلمات بعد</div>';
   $all('[data-assign-t]').forEach(chk=>chk.addEventListener('change', async ()=>{
     const t=chk.dataset.assignT, s=chk.dataset.assignS;
-    if(chk.checked) await db.ref(`assignments/${t}/${s}`).set(true);
-    else await db.ref(`assignments/${t}/${s}`).remove();
+    if(chk.checked){
+      await db.ref(`assignments/${t}/${s}`).set(true);
+      await db.ref(`studentTeacher/${s}`).set(t); // فهرس عكسي: الطالب يقرأ سطر واحد بس مش كل شجرة assignments
+    } else {
+      await db.ref(`assignments/${t}/${s}`).remove();
+      const cur = await db.ref(`studentTeacher/${s}`).get();
+      if(cur.exists() && cur.val()===t) await db.ref(`studentTeacher/${s}`).remove();
+    }
     toast('تم تحديث الربط');
   }));
 }
@@ -827,12 +839,17 @@ function tplTeacherStudents(){
 }
 async function loadTeacherStudents(){
   const myUid = state.user.uid;
-  const [assignSnap, usersSnap, presenceSnap, progressSnap] = await Promise.all([
-    db.ref('assignments/'+myUid).get(), db.ref('users').get(), db.ref('presence').get(), db.ref('progress').get()
-  ]);
+  const assignSnap = await db.ref('assignments/'+myUid).get();
   const myStudentIds = Object.keys(assignSnap.val()||{});
-  const users = usersSnap.val()||{}; const presence = presenceSnap.val()||{}; const progress = progressSnap.val()||{};
   if(!myStudentIds.length){ $('#myStudentsList').innerHTML = '<div class="empty-state"><span class="emoji">🌙</span>لا يوجد طلاب مخصصين لك بعد</div>'; return; }
+  // نجيب بس بيانات الطلاب المخصصين لينا (مش شجرة /users أو /presence أو /progress كاملة)
+  const perStudent = await Promise.all(myStudentIds.map(sid=>Promise.all([
+    db.ref('users/'+sid).get(), db.ref('presence/'+sid).get(), db.ref('progress/'+sid).get()
+  ])));
+  const users={}, presence={}, progress={};
+  myStudentIds.forEach((sid,i)=>{
+    users[sid]=perStudent[i][0].val()||{}; presence[sid]=perStudent[i][1].val()||{}; progress[sid]=perStudent[i][2].val()||{};
+  });
   $('#myStudentsList').innerHTML = myStudentIds.map(sid=>{
     const s = users[sid]||{name:'طالب'};
     const online = presence[sid]?.online;
@@ -960,13 +977,9 @@ function tplStudentHome(){
 }
 async function findMyTeacher(){
   if(myTeacherCache) return myTeacherCache;
-  const snap = await db.ref('assignments').get();
-  const all = snap.val()||{};
-  const myUid = state.user.uid;
-  for(const [tid, list] of Object.entries(all)){
-    if(list && list[myUid]){ myTeacherCache = tid; return tid; }
-  }
-  return null;
+  const snap = await db.ref('studentTeacher/'+state.user.uid).get();
+  myTeacherCache = snap.val() || null;
+  return myTeacherCache;
 }
 async function loadStudentHome(){
   const tid = await findMyTeacher();
@@ -1029,7 +1042,7 @@ function tplSettings(){
   </div>
   <div class="section-title">كلمة المرور</div>
   <div class="card" style="margin-bottom:16px">
-    <div class="field"><label>كلمة مرور جديدة</label><input id="newPass" type="password" placeholder="6 أحرف على الأقل"></div>
+    <div class="field"><label>كلمة مرور جديدة</label><input id="newPass" type="password" placeholder="8 أحرف على الأقل"></div>
     <button class="btn secondary" id="btnChangePass">تحديث كلمة المرور</button>
   </div>
   <button class="btn danger" id="btnLogoutSettings">تسجيل الخروج</button>`;
@@ -1039,7 +1052,7 @@ function bindSettingsEvents(){
   $('#btnLogoutSettings')?.addEventListener('click', logout);
   $('#btnChangePass')?.addEventListener('click', async ()=>{
     const np = $('#newPass').value;
-    if(np.length<6){ toast('كلمة المرور قصيرة جدًا'); return; }
+    if(np.length<8){ toast('كلمة المرور قصيرة جدًا'); return; }
     try{ await state.user.updatePassword(np); toast('تم تحديث كلمة المرور'); $('#newPass').value=''; }
     catch(e){ toast('أعد تسجيل الدخول ثم حاول مرة أخرى'); }
   });
