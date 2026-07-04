@@ -565,16 +565,38 @@ auth.onAuthStateChanged(user=>{
   teardownChat(); teardownCallListener();
   if(!user){ state.user=null; state.profile=null; state.route='auth'; render(); return; }
   state.user = user;
-  profileRef = db.ref('users/'+user.uid);
-  profileRef.on('value', snap=>{
-    const p = snap.val();
-    if(!p){ state.route='auth'; render(); return; }
-    state.profile = p;
-    if(p.role==='admin'){ state.route='ready'; setupPresence(); }
-    else if(p.status==='banned'){ state.route='banned'; }
-    else if(p.status!=='active'){ state.route='pending'; }
-    else { state.route='ready'; setupPresence(); listenIncomingCalls(); }
-    render();
+  // فحص إضافي: عقدة admins/{uid}:true منفصلة عن users/ — بعض المشاريع بتستخدمها بدل role:"admin"
+  db.ref('admins/'+user.uid).get().then(adminSnap=>{
+    const isAdminNode = adminSnap.exists() && adminSnap.val()===true;
+    profileRef = db.ref('users/'+user.uid);
+    profileRef.on('value', snap=>{
+      const p = snap.val();
+      if(isAdminNode){
+        state.profile = {...(p||{}), role:'admin'};
+        state.route='ready'; setupPresence();
+        render(); return;
+      }
+      if(!p){ state.route='auth'; render(); return; }
+      state.profile = p;
+      if(p.role==='admin'){ state.route='ready'; setupPresence(); }
+      else if(p.status==='banned'){ state.route='banned'; }
+      else if(p.status!=='active'){ state.route='pending'; }
+      else { state.route='ready'; setupPresence(); listenIncomingCalls(); }
+      render();
+    });
+  }).catch(()=>{
+    // لو مفيش صلاحية قراءة admins/ أصلاً، كمّل بالمسار العادي
+    profileRef = db.ref('users/'+user.uid);
+    profileRef.on('value', snap=>{
+      const p = snap.val();
+      if(!p){ state.route='auth'; render(); return; }
+      state.profile = p;
+      if(p.role==='admin'){ state.route='ready'; setupPresence(); }
+      else if(p.status==='banned'){ state.route='banned'; }
+      else if(p.status!=='active'){ state.route='pending'; }
+      else { state.route='ready'; setupPresence(); listenIncomingCalls(); }
+      render();
+    });
   });
 });
 function setupPresence(){
